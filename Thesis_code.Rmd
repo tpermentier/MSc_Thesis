@@ -1,0 +1,1979 @@
+---
+title: "MSc Thesis - Coral light acclimatization: illuminating the Montipora capitata proteome"
+author: "Permentier"
+date: "2024-06-14"
+output: html_document
+---
+
+# Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(arrow)
+  library(tidyr)
+  library(DEP)
+  library(vegan)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(limma)
+  library(tibble)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(pathview)
+  library(ggrepel)
+  library(Biostrings)
+  library(KEGGREST)
+  library(WGCNA)
+  library(GO.db)
+  library(topGO)
+  library(ggVennDiagram)
+  library(gridExtra)
+  library(stringr)
+  library(circlize)
+})
+```
+
+# Sequence database
+
+This is the FASTA used for searching M. capitata proteins.
+```{r}
+FASTA_Mcap <- readAAStringSet("C:/Users/trist/OneDrive - Vrije Universiteit Brussel/Desktop/Thesis/Proteomics/FASTA/Genome/Stephens/Montipora_capitata_HIv3.genes.pep.FASTA")
+length(FASTA_Mcap)
+head(names(FASTA_Mcap))
+```
+
+Symbionts.
+```{r}
+FASTA_symbiont <- readAAStringSet("C:/Users/trist/OneDrive - Vrije Universiteit Brussel/Desktop/Thesis/Proteomics/FASTA/Symbiodiniaceae/Reefgenomics clade C1/SymbC1.Gene_Models.PEP.FASTA")
+length(FASTA_symbiont)
+head(names(FASTA_symbiont))
+```
+cRAP:
+```{r}
+FASTA_cRAP <- readAAStringSet("C:/DIA-NN/1.9/camprotR_240512_cRAP_20190401_full_tags.FASTA")
+length(FASTA_cRAP)
+head(names(FASTA_cRAP))
+```
+
+Sequence database.
+```{r}
+FASTA_df <- rbind(tibble(FASTA_header = names(FASTA_Mcap),Sequence = as.character(FASTA_Mcap)) %>%
+                    mutate(Organism = "Montipora capitata"),
+                  tibble(FASTA_header = names(FASTA_symbiont),Sequence = as.character(FASTA_symbiont)) %>%
+                    mutate(Organism = "Symbiodiniaceae"),
+                  tibble(FASTA_header = names(FASTA_cRAP),Sequence = as.character(FASTA_cRAP)) %>%
+                    mutate(Organism = "cRAP"))
+```
+
+# Experimental design
+
+Experimental design table
+```{r}
+design <- read.csv("C:/Users/trist/OneDrive - Vrije Universiteit Brussel/Desktop/Thesis/Proteomics/Metadata/GoogleDrive_Emma/DIA_metadata.csv")
+design <- design %>% 
+  mutate_all(as.factor) %>%
+  mutate(Treatment = recode(Treatment, `C` = "Light", `S` = "Shade")) %>%
+  filter(Method == "DIA")
+```
+
+Necessary for SummarizedExperiment: condition, label and replicate columns (lower caps).
+```{r}
+design <- design %>%
+  group_by(Treatment) %>%
+  dplyr::rename(condition = Treatment) %>%
+  mutate(replicate = row_number(),
+         label=paste(condition, replicate, sep = "_")) %>%
+  ungroup() %>%
+  dplyr::select(File.Name,Tag,Sample_ID,label,everything())
+design
+```
+
+# DIA-NN
+
+Load the parquet data and exclude false discoveries: 600K precursor ion identifications/quantifications.
+```{r}
+dfp <- read_parquet("report.parquet")
+```
+
+For every identification in each file, match the file name to the label. label will form the connection between the assay data and the design data in the SummarizedExperiment.
+```{r}
+dfp <- dfp %>%
+  dplyr::rename(File.Name = Run) %>%
+  dplyr::left_join(design %>% dplyr::select(File.Name,label), by = "File.Name") %>%
+  dplyr::select(label,File.Name,everything())
+```
+
+Get the protein measurements.
+```{r}
+dfp_proteins <- dfp %>%
+  #Exclude false discoveries (FDR < 0.01%)
+  filter(Global.PG.Q.Value <= 0.01) %>%
+  # Transform precursor ion format to protein group format: retain protein groups with maximal LFQ value
+  group_by(Protein.Group, label) %>%
+  filter(PG.MaxLFQ.Quality == max(PG.MaxLFQ.Quality, na.rm = TRUE)) %>%
+  dplyr::slice(1)  # In case of ties, take the first one
+dim(dfp_proteins)[1]
+```
+
+Wide format protein Abundance data: 8378 protein groups.
+```{r}
+prot <- dfp_proteins %>%
+  dplyr::select(c("Protein.Group","Genes","PG.Normalised","label")) %>%
+  pivot_wider(names_from = label, values_from = PG.Normalised)
+dim(prot)
+```
+
+Match organism information to protein groups.
+```{r}
+prot_organism <- prot %>%
+  mutate(Protein_Group = Protein.Group) %>%
+  separate_rows(Protein.Group,sep=";") %>%
+  dplyr::select(Protein_Group,Protein.Group) %>%
+  dplyr::rename(Protein = Protein.Group) %>%
+  mutate(Organism = ifelse(grepl("Montipora_capitata",Protein),"Montipora capitata",
+                           ifelse(grepl("cRAP",Protein),"cRAP",
+                                  ifelse(grepl("Symb",Protein),"Symbiodiniaceae","Code failure")))) %>%
+  group_by(Protein_Group) %>%
+  summarize(Organism_list = paste(unique(Organism), collapse = ";")) %>%
+  mutate(Organism = ifelse(grepl(";",Organism_list),"uncertain",Organism_list)) %>%
+  dplyr::select(Protein_Group,Organism) %>%
+  dplyr::rename(Protein.Group = Protein_Group) %>%
+  mutate(Organism = as.factor(Organism)) %>%
+  distinct()
+unique(prot_organism$Organism)
+```
+
+Add organism information to protein dataset.
+```{r}
+prot <- prot %>%
+  left_join(prot_organism,by="Protein.Group") %>%
+  dplyr::select(Organism,everything())
+dim(prot)
+```
+
+Long format protein abundance data.
+```{r}
+prot_long <- prot %>%
+  pivot_longer(
+    cols = matches("^(Light_|Shade_)"),
+    names_to = "label",
+    values_to = "PG.Normalised"
+  ) %>%
+  left_join(design,by="label")
+dim(prot_long)
+```
+# Generate SummarizedExperiment object
+
+Input protein data.
+```{r}
+protein_data <- prot %>% 
+  filter(Organism !="cRAP")
+dim(prot)[1]
+dim(protein_data)[1]
+```
+
+Proteins must get a name and ID column using make_unique.
+```{r}
+data_unique <- make_unique(protein_data,"Protein.Group","Genes")
+data_unique <- data_unique %>%
+  dplyr::select(name,ID,everything())
+dim(data_unique)[1]
+```
+
+Are there any duplicated names?
+```{r}
+data_unique$name %>% duplicated() %>% any()
+```
+
+Next we need an integer vector with column numbers indicating the label names of the columns containing the assay data.
+```{r}
+columns <- grep("_",colnames(data_unique))
+colnames(data_unique)[columns]
+```
+
+```{r}
+data_se <- make_se(data_unique,columns,design)
+```
+
+# Data inspection
+
+Number of protein groups per organism.
+```{r}
+prot_organism_count <- prot %>%
+  group_by(Organism) %>%
+  summarize(Total=n())
+prot_organism_count
+```
+
+Venn diagrams.
+```{r}
+Mcap_sets_condition <- prot_long %>%
+  filter(!is.na(PG.Normalised),Organism=="Montipora capitata") %>%
+  group_by(condition) %>%
+  summarize(proteins = list(unique(Protein.Group))) %>%
+  ungroup() %>%
+  deframe()
+
+venn_Mcap_condition <- ggVennDiagram(Mcap_sets_condition, label = "count",label_alpha = 0) +
+  scale_fill_gradient(low = "lightblue", high = "royalblue3")
+
+Mcap_sets_Genotype <- prot_long %>%
+  filter(!is.na(PG.Normalised),Organism=="Symbiodiniaceae") %>%
+  group_by(Genotype) %>%
+  summarize(proteins = list(unique(Protein.Group))) %>%
+  ungroup() %>%
+  deframe()
+
+venn_Mcap_Genotype <- ggVennDiagram(Mcap_sets_Genotype, label = "count",label_alpha = 0) +
+  scale_fill_gradient(low = "lightblue", high = "royalblue3")
+
+symb_sets_condition <- prot_long %>%
+  filter(!is.na(PG.Normalised),Organism != "Montipora capitata") %>%
+  group_by(condition) %>%
+  summarize(proteins = list(unique(Protein.Group))) %>%
+  ungroup() %>%
+  deframe()
+
+venn_symb_condition <- ggVennDiagram(symb_sets_condition, label = "count",label_alpha = 0) +
+  scale_fill_gradient(low = "lightblue", high = "royalblue3")
+
+symb_sets_Genotype <- prot_long %>%
+  filter(!is.na(PG.Normalised),Organism != "Symbiodiniaceae") %>%
+  group_by(Genotype) %>%
+  summarize(proteins = list(unique(Protein.Group))) %>%
+  ungroup() %>%
+  deframe()
+
+venn_symb_Genotype <- ggVennDiagram(symb_sets_Genotype, label = "count",label_alpha = 0) +
+  scale_fill_gradient(low = "lightblue", high = "royalblue3")
+grid.arrange(venn_Mcap_Genotype, venn_Mcap_condition, venn_symb_Genotype, venn_symb_condition, nrow = 2, ncol = 2)
+```
+
+Number of protein groups per organism per sample.
+```{r}
+prot_organism_sample_count <- prot_long %>%
+  filter(!is.na(PG.Normalised)) %>%
+  group_by(Sample_ID,Organism) %>%
+  summarize(ProteinCount = sum(!is.na(PG.Normalised)))
+
+composition <- ggplot(prot_organism_sample_count %>% 
+                        filter(Organism != "cRAP"),
+                      aes(x=Sample_ID,y=ProteinCount,fill=Organism)) +
+  geom_bar(
+    stat = "identity",
+    position = "stack",
+    width=0.6,
+    color="black") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = c("Montipora capitata" = "white",
+                               "Symbiodiniaceae" = "black")) +
+  theme_minimal() +
+  labs(y = "Number of protein groups") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5))
+composition
+```
+
+Signal intensity distribution per sample.
+```{r}
+prot_organism_sample_percentage <- prot_long %>%
+  filter(!is.na(PG.Normalised)) %>%
+  group_by(Sample_ID,Organism) %>%
+  summarize(Itensity_sum = sum(log2(PG.Normalised))) %>%
+  group_by(Sample_ID) %>%
+  mutate(Total = sum(Itensity_sum),
+         Percentage = (Itensity_sum / Total) * 100) %>%
+  ungroup() %>%
+  mutate(Sample_ID = ifelse(grepl("C_", Sample_ID), 
+                            sub("C_", "H_", Sample_ID), 
+                            sub("S_", "L_", Sample_ID)))
+
+composition <- ggplot(prot_organism_sample_percentage %>% 
+                        filter(Organism != "cRAP"),
+                      aes(x=Sample_ID,y=Percentage,fill=Organism)) +
+  geom_bar(
+    stat = "identity",
+    position = "stack",
+    width=0.6,
+    color="black") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = c("Montipora capitata" = "white",
+                               "Symbiodiniaceae" = "black")) +
+  theme_minimal() +
+  labs(y = "Relative % intensity",
+       x = "Sample") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5)) +
+  theme(panel.grid = element_blank())
+composition
+```
+TIC signal is not dependent on condition or on Genotype.
+```{r}
+anova_result <- aov(TIC ~ Genotype + condition, data = design %>% 
+                      filter(Method == "DIA") %>%
+                      mutate(TIC = as.numeric(TIC)))
+anova_summary <- summary(anova_result)
+ggplot(design %>% 
+         filter(Method == "DIA") %>%
+         mutate(TIC = as.numeric(TIC)), aes(x = Genotype, y = TIC, fill = condition)) +
+  geom_boxplot() +
+  theme_minimal() +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  labs(x = "Genotype",
+       y = "Total Ion Currrent (TIC)",
+       title = sprintf("TIC ≠ condition (p = %.4f) + Genotype (p = %.4f)", 
+                       anova_summary[[1]]$`Pr(>F)`[1],
+                       anova_summary[[1]]$`Pr(>F)`[1]))
+```
+
+```{r}
+prot_long <- prot_long %>%
+  left_join(data_unique %>% dplyr::select(name,Protein.Group),by="Protein.Group") %>%
+  mutate(Log2Intensity=log2(PG.Normalised))
+```
+
+All proteins are good proteins (i.e. don't need to be filtered out).
+```{r}
+prot_wide <- data.frame(SummarizedExperiment::assay(data_se))
+colnames(prot_wide) <- SummarizedExperiment::colData(data_se)$Sample_ID
+prot_wide <- prot_wide %>%
+  rownames_to_column(var="name") %>%
+  left_join(data_unique %>% dplyr::select(name,ID,Protein.Group,Organism,Genes),by="name") %>%
+  dplyr::select(name,ID,Protein.Group,Organism,Genes,everything())
+
+Abundances <- prot_wide %>%
+  dplyr::select(-c(ID,Protein.Group,Organism,Genes)) %>%
+  column_to_rownames(var="name") %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  t()
+
+gsg = goodSamplesGenes(Abundances, verbose=3);
+gsg$allOK
+```
+
+Overlap between samples
+```{r}
+# Plot a barplot of the protein identification overlap between samples
+prot_freq_plot <- plot_frequency(data_se)
+prot_freq_plot
+```
+
+Overlap between samples (coverage plot).
+```{r}
+# Plot a barplot of the protein identification overlap between samples
+coverage_plot <- plot_coverage(data_se)
+coverage_plot
+```
+
+Data normalization.DIANN does this, so this is just for illustration purposes.
+```{r}
+norm_plot <- plot_normalization(data_se)
+norm_plot
+```
+
+Proteins with missing values have on average low intensities: below the detection limit.
+```{r}
+missing_density_plot <- plot_detect(data_se)
+missing_density_plot
+```
+
+# Practical reformatting of the data
+
+Wide format.
+```{r}
+prot_wide <- data.frame(SummarizedExperiment::assay(data_se))
+colnames(prot_wide) <- SummarizedExperiment::colData(data_se)$Sample_ID
+prot_wide <- prot_wide %>%
+  rownames_to_column(var="name") %>%
+  left_join(data_unique %>% dplyr::select(name,ID,Protein.Group,Organism,Genes),by="name") %>%
+  dplyr::select(name,ID,Protein.Group,Organism,Genes,everything())
+```
+
+Number of protein groups.
+```{r}
+dim(prot_wide)[1]
+```
+
+# Ordination and multivariate testing Montipora capitata
+
+Select Montipora capitata.
+```{r}
+Mcap_ordination_data <- prot_wide %>%
+  filter(Organism == "Montipora capitata")
+dim(Mcap_ordination_data)
+```
+
+Format protein data for vegan.
+```{r}
+Abundances <- Mcap_ordination_data %>%
+  filter(Organism == "Montipora capitata") %>%
+  dplyr::select(-c(ID,Protein.Group,Organism,Genes)) %>%
+  column_to_rownames(var="name") %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  t()
+```
+
+NMDS.
+```{r}
+# NMDS
+set.seed(123)
+nmds <- metaMDS(Abundances, distance = "bray", k = 2)
+nmds_points <- as.data.frame(nmds$points)
+nmds_points <- tibble::rownames_to_column(nmds_points,var="Sample_ID")
+nmds_metadata <- nmds_points %>% 
+  left_join(design %>% dplyr::select("condition","Genotype","Sample_ID","label","Sampled_twice","Plate.Row","Plate.Column"),by="Sample_ID")
+nmds_stress_coral <- nmds$stress
+```
+
+Bray Curtis distances.
+```{r}
+dist_matrix <- vegdist(Abundances, method = "bray")
+```
+
+I'm not detecting a batch effect.
+```{r}
+permanova_result_batch <- adonis2(dist_matrix ~ condition + Genotype + Plate.Row + Plate.Column, data = nmds_metadata)
+batch_plot <- ggplot(nmds_metadata, aes(x = MDS1, y = MDS2)) +
+  geom_point(aes(color = Plate.Row)) +
+  theme_minimal() +
+  labs(title = paste("Irradiance p = ",format(permanova_result_batch$`Pr(>F)`[1], digits=3),
+                     "Genotype p = ",format(permanova_result_batch$`Pr(>F)`[2], digits=3),
+                     "Row p = ",format(permanova_result_batch$`Pr(>F)`[3], digits=3),
+                     "Column p = ",format(permanova_result_batch$`Pr(>F)`[4], digits=3)), x = "NMDS1", y = "NMDS2")
+batch_plot
+```
+
+PERMANOVA using Bray-Curtis distance four our question.
+```{r}
+permanova_result <- adonis2(dist_matrix ~ condition + Genotype, data = nmds_metadata)
+p_value_condition_coral <- permanova_result$`Pr(>F)`[1]
+p_value_Genotype_coral <- permanova_result$`Pr(>F)`[2]
+
+hull.Light <- nmds_metadata[nmds_metadata$condition == "Light", ][chull(nmds_metadata[nmds_metadata$condition == 
+    "Light", c("MDS1", "MDS2")]), ]  # hull values for control
+hull.Shade <- nmds_metadata[nmds_metadata$condition == "Shade", ][chull(nmds_metadata[nmds_metadata$condition == 
+    "Shade", c("MDS1", "MDS2")]), ]  # hull values for shade
+
+hulls_condition <- rbind(hull.Light, hull.Shade)  #combine hulls
+
+# Convert Sampled_twice to logical if it's not already
+nmds_metadata$Color <- ifelse(as.logical(nmds_metadata$Sampled_twice), "Same shaded colony analyzed twice", as.character(nmds_metadata$condition))
+# Plot
+nmds_metadata_coral <- nmds_metadata
+NMDS_plot_coral <- ggplot(nmds_metadata, aes(x = MDS1, y = MDS2)) +
+  geom_point(aes(color = Color, shape = Genotype)) +
+  geom_polygon(data=hulls_condition,aes(x=MDS1,y=MDS2,fill=condition,group=condition),alpha=0.30)  +
+  scale_fill_manual(values = c("Light" = "goldenrod", "Shade" = "blue")) +
+  scale_color_manual(values = c("Light" = "goldenrod", "Shade" = "blue", "Same shaded colony analyzed twice" = "red2")) +
+  theme_minimal() +
+  theme(panel.grid = element_blank())#+
+  # labs(title = paste("NMDS stress = ", round(nmds_stress * 100, 2),
+  #                    "%, condition p = ", format(p_value_condition, digits=3),
+  #                    ", genotype p = ", format(p_value_Genotype, digits=3),sep=''),
+  #      x = "NMDS1",
+  #      y = "NMDS2")
+
+NMDS_plot_coral
+```
+
+# Ordination and multivariate testing symbionts
+
+Select symbionts.
+```{r}
+symbiont_ordination_data <- prot_wide %>%
+  filter(Organism != "Montipora capitata")
+dim(symbiont_ordination_data)
+```
+
+Format protein data for vegan.
+```{r}
+Abundances <- symbiont_ordination_data %>%
+  dplyr::select(-c(ID,Protein.Group,Organism,Genes)) %>%
+  column_to_rownames(var="name") %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  t()
+```
+
+NMDS.
+```{r}
+# NMDS
+set.seed(123)
+nmds <- metaMDS(Abundances, distance = "bray", k = 2)
+nmds_points <- as.data.frame(nmds$points)
+nmds_points <- tibble::rownames_to_column(nmds_points,var="Sample_ID")
+nmds_metadata <- nmds_points %>% 
+  left_join(design %>% dplyr::select("condition","Genotype","Sample_ID","label","Sampled_twice","Plate.Row","Plate.Column"),by="Sample_ID")
+```
+
+NMDS stress.
+```{r}
+nmds$stress
+```
+
+I'm not detecting a batch effect.
+```{r}
+dist_matrix <- vegdist(Abundances, method = "bray") # Bray Curtis distances
+permanova_result_batch <- adonis2(dist_matrix ~ condition + Genotype + Plate.Row + Plate.Column, data = nmds_metadata)
+batch_plot <- ggplot(nmds_metadata, aes(x = MDS1, y = MDS2)) +
+  geom_point(aes(color = Plate.Row)) +
+  theme_minimal() +
+  labs(title = paste("Irradiance p = ",format(permanova_result_batch$`Pr(>F)`[1], digits=3),
+                     "Genotype p = ",format(permanova_result_batch$`Pr(>F)`[2], digits=3),
+                     "Row p = ",format(permanova_result_batch$`Pr(>F)`[3], digits=3),
+                     "Column p = ",format(permanova_result_batch$`Pr(>F)`[4], digits=3)), x = "NMDS1", y = "NMDS2")
+batch_plot
+```
+
+5 weird abnormal samples belonging to Genotype 6O (the only D-dominated genotype under analysis according to ITS2 sequencing).
+```{r}
+Genotype_60_plot <- ggplot(nmds_metadata, aes(x = MDS1, y = MDS2)) +
+  geom_point(aes(color = Genotype)) +
+  theme_minimal()
+Genotype_60_plot
+```
+
+Filter out genotype 60.
+```{r}
+Abundances <- rownames_to_column(data.frame(Abundances),var = "Sample_ID") %>%
+  left_join(design %>% dplyr::select(Sample_ID,Genotype),by="Sample_ID") %>%
+  filter(Genotype != "60") %>%
+  dplyr::select(-Genotype) %>%
+  column_to_rownames(var="Sample_ID") %>%
+  as.matrix()
+```
+
+NMDS.
+```{r}
+# NMDS
+set.seed(123)
+nmds <- metaMDS(Abundances, distance = "bray", k = 2)
+nmds_points <- as.data.frame(nmds$points)
+nmds_points <- tibble::rownames_to_column(nmds_points,var="Sample_ID")
+nmds_metadata <- nmds_points %>% 
+  left_join(design %>% dplyr::select("condition","Genotype","Sample_ID","label","Sampled_twice","Plate.Row","Plate.Column"),by="Sample_ID")
+nmds_stress_symbiont <- nmds$stress
+```
+
+PERMANOVA using Bray-Curtis distance four our question.
+```{r}
+dist_matrix <- vegdist(Abundances, method = "bray") # Bray Curtis distances
+permanova_result <- adonis2(dist_matrix ~ condition + Genotype, data = nmds_metadata)
+p_value_condition_symbiont <- permanova_result$`Pr(>F)`[1]
+p_value_Genotype_symbiont <- permanova_result$`Pr(>F)`[2]
+
+hull.Light <- nmds_metadata[nmds_metadata$condition == "Light", ][chull(nmds_metadata[nmds_metadata$condition == 
+    "Light", c("MDS1", "MDS2")]), ]  # hull values for control
+hull.Shade <- nmds_metadata[nmds_metadata$condition == "Shade", ][chull(nmds_metadata[nmds_metadata$condition == 
+    "Shade", c("MDS1", "MDS2")]), ]  # hull values for shade
+
+hulls_condition <- rbind(hull.Light, hull.Shade)  #combine hulls
+
+# Convert Sampled_twice to logical if it's not already
+nmds_metadata$Color <- ifelse(as.logical(nmds_metadata$Sampled_twice), "Same shaded colony analyzed twice", as.character(nmds_metadata$condition))
+# Plot
+nmds_metadata_symbiont <- nmds_metadata
+NMDS_plot_symbiont <- ggplot(nmds_metadata, aes(x = MDS1, y = MDS2)) +
+  geom_point(aes(color = Color, shape = Genotype)) +
+  geom_polygon(data=hulls_condition,aes(x=MDS1,y=MDS2,fill=condition,group=condition),alpha=0.30)  +
+  scale_fill_manual(values = c("Light" = "goldenrod", "Shade" = "blue")) +
+  scale_color_manual(values = c("Light" = "goldenrod", "Shade" = "blue", "Same shaded colony analyzed twice" = "red2")) +
+  theme_minimal() +
+  theme(panel.grid = element_blank())#+
+  # labs(title = paste("NMDS stress = ", round(nmds_stress * 100, 2), 
+  #                    "%, condition p = ", format(p_value_condition, digits=3),
+  #                    ", genotype p = ", format(p_value_Genotype, digits=3),sep=''), 
+  #      x = "NMDS1", 
+  #      y = "NMDS2")
+
+NMDS_plot_symbiont
+```
+
+# Unite NMDS plots
+
+```{r}
+nmds_metadata_holobiont <- rbind(nmds_metadata_coral %>% 
+                                   mutate(Organism = "Montipora capitata"),
+                                 nmds_metadata_symbiont %>% 
+                                   mutate(Organism = "Symbiodiniaceae"))
+
+# Function to calculate convex hull for a given group
+calculate_hull <- function(df) df[chull(df$MDS1, df$MDS2), ]
+
+# Subplot title
+nmds_metadata_holobiont <- nmds_metadata_holobiont %>%
+  mutate(Subplot_title = paste(Organism,"\nStress = ",ifelse(Organism == "Montipora capitata",
+                                                             format(nmds_stress_coral,digits=3),
+                                                             format(nmds_stress_symbiont,digits=3)),
+                               "\nGenotype p = ",ifelse(Organism == "Montipora capitata",p_value_Genotype_coral,p_value_Genotype_symbiont),
+                               "\nLight p = ",ifelse(Organism == "Montipora capitata",p_value_condition_coral,p_value_condition_symbiont)))
+
+# Calculate convex hulls for each Organism and Color group
+hulls <- nmds_metadata_holobiont %>%
+  mutate(Color = ifelse(Color == "Same shaded colony analyzed twice","Shade",Color)) %>%
+  group_by(Subplot_title, Color) %>%
+  do(calculate_hull(.)) %>%
+  ungroup()
+
+# Create the plot with polygons
+NMDS_plot_holobiont <- ggplot(nmds_metadata_holobiont,
+                             aes(x = MDS1, y = MDS2)) +
+  geom_polygon(data = hulls, aes(fill = Color, group = interaction(Organism, Color)), alpha = 0.3) +
+  geom_point(aes(color = Color, shape = Genotype)) +
+  scale_fill_manual(values = c("Light" = "goldenrod", "Shade" = "blue")) +
+  scale_color_manual(values = c("Light" = "goldenrod", "Shade" = "blue", "Same shaded colony analyzed twice" = "red2")) +
+  theme_minimal() +
+  facet_wrap(~Subplot_title) +
+  theme(panel.grid = element_blank())
+
+NMDS_plot_holobiont
+```
+
+
+# Differential Abundance analysis
+
+Model, taking into account Genotype as a fixed factor.
+```{r}
+model_design <- model.matrix(~ condition + Genotype, data = SummarizedExperiment::colData(data_se))
+colnames(model_design)[colnames(model_design) == "(Intercept)"] <- "Intercept"
+fit <- lmFit(SummarizedExperiment::assay(data_se), model_design)
+contrast.matrix <- makeContrasts(conditionShade, levels = model_design)
+fit <- contrasts.fit(fit, contrast.matrix)
+fit <- eBayes(fit)
+```
+
+Differentially abundant proteins.
+```{r}
+prot_DAP <- topTable(fit, adjust.method = "BH", number = Inf) %>% 
+  dplyr::rename(log2FC = logFC) %>%
+  mutate(log2FC = -log2(10^log2FC)) %>% 
+  mutate(Abundance = ifelse(adj.P.Val < 0.05 & abs(log2FC) > 1.5,ifelse(log2FC > 1.5,"up","down"),"no difference")) %>%
+  rownames_to_column(var="name") %>%
+  left_join(data_unique %>% dplyr::select(Organism,Protein.Group,name),by="name") %>%
+  dplyr::select(Organism,name,Protein.Group,everything())
+```
+
+# Differences in Montipora capitata
+
+CD-Search. Contains multiple entries for the same query.
+```{r}
+Mcap_CD <- read.csv("C:/Users/trist/OneDrive - Vrije Universiteit Brussel/Desktop/Thesis/Proteomics/FASTA/Genome/Stephens/Montipora_capitata_HIv3.genes.Conserved_Domain_Search_results.txt",sep="\t")
+colnames(Mcap_CD)
+dim(Mcap_CD)[1]
+length(unique(Mcap_CD$Query))
+```
+
+EggNog.
+```{r}
+Mcap_egg <- read.csv("C:/Users/trist/OneDrive - Vrije Universiteit Brussel/Desktop/Thesis/Proteomics/FASTA/Genome/Stephens/Montipora_capitata_HIv3.genes.EggNog_results.txt",sep="\t")
+colnames(Mcap_egg)
+dim(Mcap_egg)[1]
+```
+
+KEGG.
+```{r}
+Mcap_KEGG <- read.csv("C:/Users/trist/OneDrive - Vrije Universiteit Brussel/Desktop/Thesis/Proteomics/FASTA/Genome/Stephens/Montipora_capitata_HIv3.genes.KEGG_results.txt",sep="\t")
+colnames(Mcap_KEGG)
+dim(Mcap_KEGG)[1]
+```
+
+Bind egg and KEGG together.
+```{r}
+Mcap_bio <- Mcap_KEGG %>%
+  left_join(Mcap_egg,by="Query")
+colnames(Mcap_bio)
+length(FASTA_Mcap)
+dim(Mcap_bio)[1]
+```
+
+Add data to differential abundance data.
+```{r}
+Mcap_DAP <- prot_DAP %>%
+  filter(Organism == "Montipora capitata") %>%
+  left_join(Mcap_bio %>% dplyr::rename(name=Query),by="name")
+colnames(Mcap_DAP)
+dim(Mcap_DAP)[1]
+```
+
+Heatmap.
+```{r}
+Abundance_DAP <- prot_wide %>%
+  filter(Organism == "Montipora capitata") %>%
+  dplyr::select(-c(Organism,ID,Protein.Group,Genes)) %>%
+  left_join(prot_DAP %>% dplyr::select(name,Abundance),by="name") %>%
+  filter(Abundance != "no difference") %>%
+  dplyr::select(-c(Abundance)) %>%
+  column_to_rownames(var="name") %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  as.matrix()
+# Z-score normalization for better visualization
+Abundance_DAP_normalized <- t(scale(t(Abundance_DAP)))
+
+# Create annotation data
+column_annotations <- design[match(colnames(Abundance_DAP_normalized), design$Sample_ID), c("Genotype", "condition")]
+genotype_symbols <- c("19" = 19, "60" = 17, "64" = 15, "64Y" = 3, "90" = 7, "P1R2" = 8)
+ha_genotype <- columnAnnotation(
+  Genotype = anno_simple(column_annotations$Genotype, pch = genotype_symbols[column_annotations$Genotype], 
+                         gp = gpar(col = "black", fill = NA,lty=0,fontsize=2))
+)
+condition_colors <- c("Light" = "gold", "Shade" = "blue")
+
+# Create the heatmap annotation for condition
+ha_condition <- columnAnnotation(
+  condition = column_annotations$condition,
+  col = list(condition = condition_colors)
+)
+
+heatmap_plot <- Heatmap(Abundance_DAP_normalized,
+        name = "Expression",
+        cluster_rows = TRUE,  # Cluster rows (proteins)
+        cluster_columns = TRUE,  # Cluster columns (samples)
+        show_row_names = FALSE, # Hide row names if too many
+        show_column_names = FALSE,  # Show column names
+        column_title = "Samples",
+        row_title = "Differentially Expressed Proteins",
+        heatmap_legend_param = list(title = "Normalized Abundance"),
+        row_km = 2,
+        column_km = 2,
+        bottom_annotation = ha_condition,
+        top_annotation = ha_genotype)
+heatmap_plot
+```
+Give names to proteins based on Preferred name and FASTA.
+```{r}
+Mcap_DAP <- Mcap_DAP %>%
+  mutate(Given_name = ifelse(Preferred_name == "-" | is.na(Preferred_name),name,Preferred_name)) %>%
+  group_by(Given_name) %>%
+  mutate(dup_count = row_number()) %>%
+  ungroup() %>%
+  mutate(Given_name = ifelse(dup_count > 1, paste0(Given_name, " (", dup_count, ")"), Given_name)) %>%
+  dplyr::select(-dup_count)
+```
+
+Volcano plot.
+```{r}
+volcano_plot <- ggplot(Mcap_DAP %>% 
+                         filter(!is.na(Abundance))%>%
+                         mutate(Preferred_name = ifelse(Preferred_name == '-',NA,Given_name)), 
+                       aes(x = log2FC, y = -log2(adj.P.Val), color = Abundance)) +
+  geom_point() +
+  geom_hline(yintercept = -log2(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("down" = "blue", "up" = "red", "no difference" = "grey")) +
+  theme_minimal() +
+  labs(title = "M. capitata proteins in the light") +
+  geom_text_repel(aes(label = ifelse(Abundance != "no difference", Preferred_name, "")), 
+                  size = 2.5, 
+                  box.padding = 0.5, 
+                  point.padding = 0.5, 
+                  max.overlaps = Inf, 
+                  segment.color = "grey50")
+volcano_plot
+```
+
+# Montipora capitata: down-regulation in the light
+
+19 down-regulated proteins. Notice that two proteins are named MFGE8.
+```{r}
+Mcap_DAP %>%
+  filter(Abundance == "down") %>%
+  dplyr::select(Given_name)
+```
+
+Pick a term.
+```{r}
+colnames(Mcap_DAP)
+```
+
+Downregulation according to BRITE.
+```{r}
+# Background, proteins of interest and relevant term.
+prot_rich_term <- Mcap_DAP %>%
+  mutate(interest = Abundance == "down") %>%
+  dplyr::rename(term = BRITE) %>%
+  filter(!is.na(term)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,term)
+# Terms associated with proteins.
+term_df <- prot_rich_term %>%
+  separate_rows(term, sep = ",")
+# Term over-representation analysis.
+term_enrich <- enricher(
+  gene = prot_rich_term %>% 
+    filter(interest == TRUE) %>%
+    dplyr::select(name) %>%
+    unlist() %>%
+    as.character(),
+  TERM2GENE = term_df %>%
+    dplyr::select(term,name),
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.01
+)
+term_enrich_result <- term_enrich@result
+term_enrich
+# Dotplot for BRITE enrichment
+Mcap_down_dotplot <- dotplot(term_enrich, showCategory=20) + ggtitle("Term over-representation analysis")
+Mcap_down_dotplot
+```
+
+ko01002 means peptidase and inhibitors. ko04090 means CD molecules. Peptidases and inhibitors:
+```{r}
+peptidases_inhibitors_plot <- Mcap_DAP %>% 
+  filter(Abundance == "down", grepl("ko01002",BRITE)) %>%
+  dplyr::select(name,Given_name) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Peptidases and inhibitors (Montipora capitata)")
+peptidases_inhibitors_plot
+```
+
+CD molecules.
+```{r}
+peptidases_inhibitors_plot <- Mcap_DAP %>% 
+  filter(Abundance == "down", grepl("ko04090",BRITE)) %>%
+  dplyr::select(name,Preferred_name) %>%
+  mutate(Preferred_name = ifelse(Preferred_name == "-",name,Preferred_name)) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Preferred_name) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "CD molecules (Montipora capitata)")
+peptidases_inhibitors_plot
+```
+
+Downregulation according to KEGG_Pathway: nothing detected.
+```{r}
+# Background, proteins of interest and relevant term.
+prot_rich_term <- Mcap_DAP %>%
+  mutate(interest = Abundance == "down") %>%
+  dplyr::rename(term = KEGG_Pathway) %>%
+  filter(!is.na(term)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,term)
+# Terms associated with proteins.
+term_df <- prot_rich_term %>%
+  separate_rows(term, sep = ",")
+# Term over-representation analysis.
+term_enrich <- enricher(
+  gene = prot_rich_term %>% 
+    filter(interest == TRUE) %>%
+    dplyr::select(name) %>%
+    unlist() %>%
+    as.character(),
+  TERM2GENE = term_df %>%
+    dplyr::select(term,name),
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.01
+)
+term_enrich_result <- term_enrich@result
+term_enrich
+```
+
+Down-regulation according to GO terms (biological process).
+```{r}
+# GO dataframe
+prot_rich_GO <- Mcap_DAP %>%
+  mutate(interest = as.numeric(Abundance == "down")) %>%
+  filter(!is.na(GOs)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,GOs)
+# Named vector of genes
+genesList <- setNames(prot_rich_GO$interest,
+                     prot_rich_GO$name)
+head(genesList)
+# GO terms
+GO_df <- prot_rich_GO %>%
+  separate_rows(GOs, sep = ",") %>%
+  dplyr::select(name,GOs)
+gene2GO <- split(GO_df$GOs,GO_df$name)
+# GOdata object
+GOdata <- new("topGOdata",
+              description = "Simple session",
+              ontology = "BP",
+              allGenes = genesList,
+              geneSelectionFun = function(x) x == 1,
+              annot = annFUN.gene2GO,
+              gene2GO = gene2GO)
+# Fisher test
+resultFisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+# Top 20
+allGO <- usedGO(GOdata)
+allRes <- GenTable(GOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = 20)
+# Match to data
+GOs_different <- allRes %>%
+  rowwise() %>%
+  mutate(
+    Proteins = Mcap_DAP %>%
+      filter(Abundance == "down", grepl(GO.ID, GOs)) %>%
+      pull(Given_name) %>%
+      paste(collapse = ", ")
+  ) %>%
+  ungroup()
+GOs_different
+# Visualization
+allRes$Term <- paste(allRes$GO.ID, allRes$Term, sep = ": ")
+allRes <- allRes %>%
+  mutate(pvalue = -log10(as.numeric(classicFisher)),
+         Term = factor(Term, levels = unique(Term[order(pvalue)])))
+pdf("Up-regulation of M. capitata BP in low light.pdf")
+graph_plot <- showSigOfNodes(GOdata, score(resultFisher), firstSigNodes = 20, useInfo = "all")
+dev.off()
+graph_plot
+GO_enrichment_plot <- ggplot(allRes, aes(x = pvalue, y = Term)) +
+    geom_point(aes(size = Significant)) +
+    theme_minimal() +
+    labs(title = "Up-regulation of M. capitata BP in low light",
+         x = "-log10(p-value)",
+         y = "Significant GO terms",
+         size = "Protein total")
+    theme(axis.text.y = element_text(size = 10),
+          axis.title = element_text(size = 12),
+          plot.title = element_text(hjust = 0.5, size = 14))
+GO_enrichment_plot
+```
+
+Downregulation according to GO terms (molecular function).
+```{r}
+# GO dataframe
+prot_rich_GO <- Mcap_DAP %>%
+  mutate(interest = as.numeric(Abundance == "down")) %>%
+  filter(!is.na(GOs)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,GOs)
+# Named vector of genes
+genesList <- setNames(prot_rich_GO$interest,
+                     prot_rich_GO$name)
+head(genesList)
+# GO terms
+GO_df <- prot_rich_GO %>%
+  separate_rows(GOs, sep = ",") %>%
+  dplyr::select(name,GOs)
+gene2GO <- split(GO_df$GOs,GO_df$name)
+# GOdata object
+GOdata <- new("topGOdata",
+              description = "Simple session",
+              ontology = "MF",
+              allGenes = genesList,
+              geneSelectionFun = function(x) x == 1,
+              annot = annFUN.gene2GO,
+              gene2GO = gene2GO)
+# Fisher test
+resultFisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+# Top 20
+allGO <- usedGO(GOdata)
+allRes <- GenTable(GOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = 20)
+# Match to data
+GOs_different <- allRes %>%
+  rowwise() %>%
+  mutate(
+    Proteins = Mcap_DAP %>%
+      filter(Abundance == "down", grepl(GO.ID, GOs)) %>%
+      pull(Given_name) %>%
+      paste(collapse = ", ")
+  ) %>%
+  ungroup()
+GOs_different
+# Visualization
+allRes$Term <- paste(allRes$GO.ID, allRes$Term, sep = ": ")
+allRes <- allRes %>%
+  mutate(pvalue = -log10(as.numeric(classicFisher)),
+         Term = factor(Term, levels = unique(Term[order(pvalue)])))
+pdf("Up-regulation of M. capitata MF in low light.pdf")
+graph_plot <- showSigOfNodes(GOdata, score(resultFisher), firstSigNodes = 20, useInfo = "all")
+dev.off()
+GO_enrichment_plot <- ggplot(allRes, aes(x = pvalue, y = Term)) +
+    geom_point(aes(size = Significant)) +
+    theme_minimal() +
+    labs(title = "Up-regulation of M. capitata MF in low light",
+         x = "-log10(p-value)",
+         y = "Significant GO terms",
+         size = "Protein total")
+    theme(axis.text.y = element_text(size = 10),
+          axis.title = element_text(size = 12),
+          plot.title = element_text(hjust = 0.5, size = 14))
+GO_enrichment_plot
+```
+
+Downregulation according to GO terms (cellular component).
+```{r}
+# GO dataframe
+prot_rich_GO <- Mcap_DAP %>%
+  mutate(interest = as.numeric(Abundance == "down")) %>%
+  filter(!is.na(GOs)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,GOs)
+# Named vector of genes
+genesList <- setNames(prot_rich_GO$interest,
+                     prot_rich_GO$name)
+head(genesList)
+# GO terms
+GO_df <- prot_rich_GO %>%
+  separate_rows(GOs, sep = ",") %>%
+  dplyr::select(name,GOs)
+gene2GO <- split(GO_df$GOs,GO_df$name)
+# GOdata object
+GOdata <- new("topGOdata",
+              description = "Simple session",
+              ontology = "CC",
+              allGenes = genesList,
+              geneSelectionFun = function(x) x == 1,
+              annot = annFUN.gene2GO,
+              gene2GO = gene2GO)
+# Fisher test
+resultFisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+# Top 20
+allGO <- usedGO(GOdata)
+allRes <- GenTable(GOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = 20)
+# Match to data
+GOs_different <- allRes %>%
+  rowwise() %>%
+  mutate(
+    Proteins = Mcap_DAP %>%
+      filter(Abundance == "down", grepl(GO.ID, GOs)) %>%
+      pull(Given_name) %>%
+      paste(collapse = ", ")
+  ) %>%
+  ungroup()
+GOs_different
+# Visualization
+allRes$Term <- paste(allRes$GO.ID, allRes$Term, sep = ": ")
+allRes <- allRes %>%
+  mutate(pvalue = -log10(as.numeric(classicFisher)),
+         Term = factor(Term, levels = unique(Term[order(pvalue)])))
+pdf("Up-regulation of M. capitata CC in low light.pdf")
+graph_plot <- showSigOfNodes(GOdata, score(resultFisher), firstSigNodes = 20, useInfo = "all")
+dev.off()
+GO_enrichment_plot <- ggplot(allRes, aes(x = pvalue, y = Term)) +
+    geom_point(aes(size = Significant)) +
+    theme_minimal() +
+    labs(title = "Up-regulation of M. capitata CC in low light",
+         x = "-log10(p-value)",
+         y = "Significant GO terms",
+         size = "Protein total")
+    theme(axis.text.y = element_text(size = 10),
+          axis.title = element_text(size = 12),
+          plot.title = element_text(hjust = 0.5, size = 14))
+GO_enrichment_plot
+```
+
+Take-home message:
+- membrane proteins (CC)
+- transporter activity (MF)
+- immunity ? (BRITE)
+- proteolytic processes? (BP)
+
+# Montipora capitata: up-regulation in the light
+
+Pick a term.
+```{r}
+colnames(Mcap_DAP)
+```
+
+Up-regulation according to BRITE: nothing detected.
+```{r}
+# Background, proteins of interest and relevant term.
+prot_rich_term <- Mcap_DAP %>%
+  mutate(interest = Abundance == "up") %>%
+  dplyr::rename(term = BRITE) %>%
+  filter(!is.na(term)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,term)
+# Terms associated with proteins.
+term_df <- prot_rich_term %>%
+  separate_rows(term, sep = ",")
+# Term over-representation analysis.
+term_enrich <- enricher(
+  gene = prot_rich_term %>% 
+    filter(interest == TRUE) %>%
+    dplyr::select(name) %>%
+    unlist() %>%
+    as.character(),
+  TERM2GENE = term_df %>%
+    dplyr::select(term,name),
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.01
+)
+term_enrich_result <- term_enrich@result
+term_enrich
+```
+
+Up-regulation according to KEGG_Pathway: nothing detected.
+```{r}
+# Background, proteins of interest and relevant term.
+prot_rich_term <- Mcap_DAP %>%
+  mutate(interest = Abundance == "up") %>%
+  dplyr::rename(term = KEGG_Pathway) %>%
+  filter(!is.na(term)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,term)
+# Terms associated with proteins.
+term_df <- prot_rich_term %>%
+  separate_rows(term, sep = ",")
+# Term over-representation analysis.
+term_enrich <- enricher(
+  gene = prot_rich_term %>% 
+    filter(interest == TRUE) %>%
+    dplyr::select(name) %>%
+    unlist() %>%
+    as.character(),
+  TERM2GENE = term_df %>%
+    dplyr::select(term,name),
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.01
+)
+term_enrich_result <- term_enrich@result
+term_enrich
+```
+
+Up-regulation according to GO terms (biological process).
+```{r}
+# GO dataframe
+prot_rich_GO <- Mcap_DAP %>%
+  mutate(interest = as.numeric(Abundance == "up")) %>%
+  filter(!is.na(GOs)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,GOs)
+# Named vector of genes
+genesList <- setNames(prot_rich_GO$interest,
+                     prot_rich_GO$name)
+head(genesList)
+# GO terms
+GO_df <- prot_rich_GO %>%
+  separate_rows(GOs, sep = ",") %>%
+  dplyr::select(name,GOs)
+gene2GO <- split(GO_df$GOs,GO_df$name)
+# GOdata object
+GOdata <- new("topGOdata",
+              description = "Simple session",
+              ontology = "BP",
+              allGenes = genesList,
+              geneSelectionFun = function(x) x == 1,
+              annot = annFUN.gene2GO,
+              gene2GO = gene2GO)
+# Fisher test
+resultFisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+# Top 20
+allGO <- usedGO(GOdata)
+allRes <- GenTable(GOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = 20)
+# Identifications
+GOs_different <- allRes %>%
+  rowwise() %>%
+  mutate(
+    Proteins = Mcap_DAP %>%
+      filter(Abundance == "up", grepl(GO.ID, GOs)) %>%
+      pull(Given_name) %>%
+      paste(collapse = ", ")
+  ) %>%
+  ungroup()
+GOs_different
+# Visualization
+allRes$Term <- paste(allRes$GO.ID, allRes$Term, sep = ": ")
+allRes <- allRes %>%
+  mutate(pvalue = -log10(as.numeric(classicFisher)),
+         Term = factor(Term, levels = unique(Term[order(pvalue)])))
+pdf("Up-regulation of M. capitata BP in high light.pdf")
+graph_plot <- showSigOfNodes(GOdata, score(resultFisher), firstSigNodes = 20, useInfo = "all")
+dev.off()
+graph_plot
+GO_enrichment_plot <- ggplot(allRes, aes(x = pvalue, y = Term)) +
+    geom_point(aes(size = Significant)) +
+    theme_minimal() +
+    labs(title = "Up-regulation of M. capitata BP in high light",
+         x = "-log10(p-value)",
+         y = "Significant GO terms",
+         size = "Protein total")
+    theme(axis.text.y = element_text(size = 10),
+          axis.title = element_text(size = 12),
+          plot.title = element_text(hjust = 0.5, size = 14))
+GO_enrichment_plot
+
+```
+Very clear signal of translation.
+
+Up-regulation according to GO terms (molecular function).
+```{r}
+# GO dataframe
+prot_rich_GO <- Mcap_DAP %>%
+  mutate(interest = as.numeric(Abundance == "up")) %>%
+  filter(!is.na(GOs)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,GOs)
+# Named vector of genes
+genesList <- setNames(prot_rich_GO$interest,
+                     prot_rich_GO$name)
+head(genesList)
+# GO terms
+GO_df <- prot_rich_GO %>%
+  separate_rows(GOs, sep = ",") %>%
+  dplyr::select(name,GOs)
+gene2GO <- split(GO_df$GOs,GO_df$name)
+# GOdata object
+GOdata <- new("topGOdata",
+              description = "Simple session",
+              ontology = "MF",
+              allGenes = genesList,
+              geneSelectionFun = function(x) x == 1,
+              annot = annFUN.gene2GO,
+              gene2GO = gene2GO)
+# Fisher test
+resultFisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+# Top 20
+allGO <- usedGO(GOdata)
+allRes <- GenTable(GOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = 20)
+# Identifications
+GOs_different <- allRes %>%
+  rowwise() %>%
+  mutate(
+    Proteins = Mcap_DAP %>%
+      filter(Abundance == "up", grepl(GO.ID, GOs)) %>%
+      pull(Given_name) %>%
+      paste(collapse = ", ")
+  ) %>%
+  ungroup()
+GOs_different
+# Visualization
+allRes$Term <- paste(allRes$GO.ID, allRes$Term, sep = ": ")
+allRes <- allRes %>%
+  mutate(pvalue = -log10(as.numeric(classicFisher)),
+         Term = factor(Term, levels = unique(Term[order(pvalue)])))
+pdf("Up-regulation of M. capitata MF in high light.pdf")
+graph_plot <- showSigOfNodes(GOdata, score(resultFisher), firstSigNodes = 20, useInfo = "all")
+dev.off()
+GO_enrichment_plot <- ggplot(allRes, aes(x = pvalue, y = Term)) +
+    geom_point(aes(size = Significant)) +
+    theme_minimal() +
+    labs(title = "Up-regulation of M. capitata MF in high light",
+         x = "-log10(p-value)",
+         y = "Significant GO terms",
+         size = "Protein total")
+    theme(axis.text.y = element_text(size = 10),
+          axis.title = element_text(size = 12),
+          plot.title = element_text(hjust = 0.5, size = 14))
+GO_enrichment_plot
+```
+Ribosomes, translation.
+
+Downregulation according to GO terms (cellular component).
+```{r}
+# GO dataframe
+prot_rich_GO <- Mcap_DAP %>%
+  mutate(interest = as.numeric(Abundance == "up")) %>%
+  filter(!is.na(GOs)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,GOs)
+# Named vector of genes
+genesList <- setNames(prot_rich_GO$interest,
+                     prot_rich_GO$name)
+head(genesList)
+# GO terms
+GO_df <- prot_rich_GO %>%
+  separate_rows(GOs, sep = ",") %>%
+  dplyr::select(name,GOs)
+gene2GO <- split(GO_df$GOs,GO_df$name)
+# GOdata object
+GOdata <- new("topGOdata",
+              description = "Simple session",
+              ontology = "CC",
+              allGenes = genesList,
+              geneSelectionFun = function(x) x == 1,
+              annot = annFUN.gene2GO,
+              gene2GO = gene2GO)
+# Fisher test
+resultFisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+# Top 20
+allGO <- usedGO(GOdata)
+allRes <- GenTable(GOdata, classicFisher = resultFisher, orderBy = "classicFisher", topNodes = 20)
+```
+
+
+```{r}
+# Identifications
+GOs_different <- allRes %>%
+  rowwise() %>%
+  mutate(
+    Proteins = Mcap_DAP %>%
+      filter(Abundance == "up", grepl(GO.ID, GOs)) %>%
+      pull(Given_name) %>%
+      paste(collapse = ", ")
+  ) %>%
+  ungroup()
+GOs_different
+```
+
+
+```{r}
+# Visualization
+allRes$Term <- paste(allRes$GO.ID, allRes$Term, sep = ": ")
+allRes <- allRes %>%
+  mutate(pvalue = -log10(as.numeric(classicFisher)),
+         Term = factor(Term, levels = unique(Term[order(pvalue)])))
+pdf("Up-regulation of M. capitata CC in high light.pdf")
+graph_plot <- showSigOfNodes(GOdata, score(resultFisher), firstSigNodes = 20, useInfo = "all")
+dev.off()
+GO_enrichment_plot <- ggplot(allRes, aes(x = pvalue, y = Term)) +
+    geom_point(aes(size = Significant)) +
+    theme_minimal() +
+    labs(title = "Up-regulation of M. capitata CC in high light",
+         x = "-log10(p-value)",
+         y = "Significant GO terms",
+         size = "Protein total")
+    theme(axis.text.y = element_text(size = 10),
+          axis.title = element_text(size = 12),
+          plot.title = element_text(hjust = 0.5, size = 14))
+GO_enrichment_plot
+```
+Ribonucleoprotein complex.
+
+
+# Montipora capitata biologically annotated heatmap
+
+Heatmap.
+```{r}
+Abundance_DAP <- prot_wide %>%
+  filter(Organism == "Montipora capitata") %>%
+  dplyr::select(-c(Organism,ID,Protein.Group,Genes)) %>%
+  left_join(prot_DAP %>% dplyr::select(name,Abundance),by="name") %>%
+  filter(Abundance != "no difference") %>%
+  dplyr::select(-c(Abundance)) %>%
+  column_to_rownames(var="name") %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  as.matrix()
+# Z-score normalization for better visualization
+Abundance_DAP_normalized <- t(scale(t(Abundance_DAP)))
+
+# Create annotation data
+column_annotations <- design[match(colnames(Abundance_DAP_normalized), design$Sample_ID), c("Genotype", "condition")]
+genotype_symbols <- c("19" = 19, "60" = 17, "64" = 15, "64Y" = 3, "90" = 7, "P1R2" = 8)
+ha_genotype <- columnAnnotation(
+  Genotype = anno_simple(column_annotations$Genotype, pch = genotype_symbols[column_annotations$Genotype], 
+                         gp = gpar(col = "black", fill = NA,lty=0,fontsize=2))
+)
+condition_colors <- c("Light" = "gold", "Shade" = "blue")
+
+# Create the heatmap annotation for condition
+ha_condition <- columnAnnotation(
+  condition = column_annotations$condition,
+  col = list(condition = condition_colors)
+)
+
+heatmap_plot <- Heatmap(Abundance_DAP_normalized,
+        name = "Expression",
+        cluster_rows = TRUE,  # Cluster rows (proteins)
+        cluster_columns = TRUE,  # Cluster columns (samples)
+        show_row_names = FALSE, # Hide row names if too many
+        show_column_names = FALSE,  # Show column names
+        column_title = "Samples",
+        row_title = "Differentially Expressed Proteins",
+        heatmap_legend_param = list(title = "Normalized Abundance"),
+        row_km = 2,
+        column_km = 2,
+        bottom_annotation = ha_condition,
+        top_annotation = ha_genotype)
+heatmap_plot
+```
+
+
+
+```{r}
+dotplot_data <- read.csv("Mcap_diff_table.csv",sep=",") %>%
+  mutate(Given_name = ifelse(grepl("Montipora_capitata", Given_name),
+                             sub("^[^.]*\\.", "", Given_name),
+                             Given_name)) %>%
+  group_by(Given_name) %>%
+  mutate(dup_count = row_number()) %>%
+  ungroup() %>%
+  mutate(Given_name = ifelse(dup_count > 1, paste0(Given_name, " (", dup_count, ")"), Given_name)) %>%
+  dplyr::select(-dup_count)
+dotplot_data
+```
+
+```{r}
+Abundance_DAP_heatmap <- prot_long %>%
+  filter(Organism == "Montipora capitata") %>%
+  mutate(Sample_ID = ifelse(grepl("C_", Sample_ID), 
+                            sub("C_", "H_", Sample_ID), 
+                            sub("S_", "L_", Sample_ID)))%>%
+  dplyr::select(c(Protein.Group,name,Sample_ID,Log2Intensity)) %>%
+  pivot_wider(names_from = Sample_ID,values_from =Log2Intensity) %>%
+  left_join(Mcap_DAP %>% dplyr::select(name,Given_name,Abundance),by="name") %>%
+  filter(Abundance != "no difference") %>%
+  dplyr::select(-c(Abundance)) %>%
+  mutate(Given_name = ifelse(grepl("Montipora_capitata", Given_name),
+                             sub("^[^.]*\\.", "", Given_name),
+                             Given_name)) %>%
+  group_by(Given_name) %>%
+  mutate(dup_count = row_number()) %>%
+  ungroup() %>%
+  mutate(Given_name = ifelse(dup_count > 1, paste0(Given_name, " (", dup_count, ")"), Given_name)) %>%
+  dplyr::select(-dup_count) %>%
+  left_join(dotplot_data,by="Given_name") %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  dplyr::select(-c(Protein.Group,name))
+
+dotplot_match <- Abundance_DAP_heatmap %>%
+  mutate(Function_numeric = as.numeric(as.factor(Function))) %>%
+  dplyr::select(Given_name,Function,Function_numeric)
+
+Abundance_DAP_heatmap <- Abundance_DAP_heatmap %>%
+  column_to_rownames(var="Given_name") %>%
+  dplyr::select(-Function) %>%
+  as.matrix()
+```
+
+```{r}
+dotplot_match <- data.frame(Abundance_DAP_heatmap) %>%
+  rownames_to_column(var="Given_name") %>%
+  left_join(dotplot_data,by="Given_name")%>%
+  mutate(Function_numeric = as.numeric(as.factor(Function))) %>%
+  dplyr::select(Given_name,Function,Function_numeric)
+```
+
+
+```{r}
+design_heatmap <- design %>%
+  mutate(Sample_ID = ifelse(grepl("C_", Sample_ID), 
+                            sub("C_", "H_", Sample_ID), 
+                            sub("S_", "L_", Sample_ID)))
+```
+
+```{r}
+# Z-score normalization for better visualization
+Abundance_DAP_normalized <- t(scale(t(Abundance_DAP_heatmap)))
+
+# Create annotation data
+condition_colors <- c("Light" = "gold", "Shade" = "blue")
+
+fa = rep(c("Light","Shade"), times = c(18,18))
+dend2 = cluster_within_group(Abundance_DAP_normalized, fa)
+
+# Create the dot plot annotation using anno_points
+ha_dotplot <- rowAnnotation(
+  Category = anno_points(dotplot_match$Function_numeric, seq(2, 50, by = 2),
+                    pch = 16,  # Point type (16 is a filled circle)
+                    gp = gpar(col = dotplot_match$Function_numeric),  # Assigning colors
+                    axis_param = list(
+                      at = seq(2, 50, by = 2),  # Adjust axis ticks
+                      labels = dotplot_match$Function
+                    )
+  ),
+  width = unit(3, "cm")  # Increase the width of the annotation
+)
+
+# Generate the heatmap with intra-group clustering
+heatmap_plot <- Heatmap(
+     Abundance_DAP_normalized,
+     name = "Expression",
+     cluster_rows = TRUE,  # Cluster rows (proteins)
+     cluster_columns = dend2,
+     show_row_names = TRUE,
+     row_names_side = "left",
+     show_column_names = TRUE,
+     column_title = "Samples",
+     row_title = "Differentially abundant proteins",
+     #heatmap_legend_param = list(title = "Normalized abundance"),
+     #top_annotation = HeatmapAnnotation(Light = fa, col = list(Light = condition_colors)),
+     right_annotation = ha_dotplot,
+     show_heatmap_legend = FALSE,
+     heatmap_width = unit(21, "cm"),
+     width = 5,
+     heatmap_height = unit(21, "cm"),
+     height = 5,)
+
+# Display the heatmap
+heatmap_plot
+```
+
+
+# Differences in the symbionts
+
+EggNog.
+```{r}
+symbiont_egg <- read.csv("Galaxy24-[eggNOG_Mapper_on_Symb.C1_Gene_Models.PEP__annotations].TABULAR",sep="\t")
+colnames(symbiont_egg)
+dim(symbiont_egg)[1]
+```
+
+KEGG.
+```{r}
+symbiont_KEGG <- read.csv("Blast_Koala_Symb.C1_Gene_Models.PEP.txt",sep="\t")
+colnames(symbiont_KEGG)
+dim(symbiont_KEGG)[1]
+```
+
+Bind egg and KEGG together.
+```{r}
+symbiont_bio <- symbiont_KEGG %>%
+  left_join(symbiont_egg,by="Query")
+colnames(symbiont_bio)
+length(FASTA_symbiont)
+dim(symbiont_bio)[1]
+```
+
+UniProt information for different proteins.
+```{r}
+symbiont_uniprot <- read.csv("symbiont_different_names.txt",sep="\t")
+colnames(symbiont_uniprot)
+dim(symbiont_uniprot)[1]
+```
+
+Add data to differential abundance data.
+```{r}
+symbiont_DAP <- prot_DAP %>%
+  filter(Organism != "Montipora capitata") %>%
+  left_join(symbiont_bio %>% dplyr::rename(name=Query),by="name") %>%
+  left_join(symbiont_uniprot,by="name") %>%
+  mutate(Given_name = ifelse(Preferred_name == "-" | is.na(Preferred_name),name,Preferred_name)) %>%
+  group_by(Given_name) %>%
+  mutate(dup_count = row_number()) %>%
+  ungroup() %>%
+  mutate(Given_name = ifelse(dup_count > 1, paste0(Given_name, " (", dup_count, ")"), Given_name)) %>%
+  dplyr::select(-dup_count)
+colnames(symbiont_DAP)
+dim(symbiont_DAP)[1]
+```
+
+Heatmap.
+```{r}
+Abundance_DAP <- prot_wide %>%
+  filter(Organism != "Montipora capitata") %>%
+  dplyr::select(-c(Organism,ID,Protein.Group,Genes)) %>%
+  left_join(prot_DAP %>% dplyr::select(name,Abundance),by="name") %>%
+  filter(Abundance != "no difference") %>%
+  dplyr::select(-c(Abundance)) %>%
+  column_to_rownames(var="name") %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  as.matrix()
+# Z-score normalization for better visualization
+Abundance_DAP_normalized <- t(scale(t(Abundance_DAP)))
+
+# Create annotation data
+column_annotations <- design[match(colnames(Abundance_DAP_normalized), design$Sample_ID), c("Genotype", "condition")]
+genotype_symbols <- c("19" = 19, "60" = 17, "64" = 15, "64Y" = 3, "90" = 7, "P1R2" = 8)
+ha_genotype <- columnAnnotation(
+  Genotype = anno_simple(column_annotations$Genotype, pch = genotype_symbols[column_annotations$Genotype], 
+                         gp = gpar(col = "black", fill = NA,lty=0,fontsize=2))
+)
+condition_colors <- c("Light" = "gold", "Shade" = "blue")
+
+# Create the heatmap annotation for condition
+ha_condition <- columnAnnotation(
+  condition = column_annotations$condition,
+  col = list(condition = condition_colors)
+)
+
+heatmap_plot <- Heatmap(Abundance_DAP_normalized,
+        name = "Expression",
+        cluster_rows = TRUE,  # Cluster rows (proteins)
+        cluster_columns = TRUE,  # Cluster columns (samples)
+        show_row_names = FALSE, # Hide row names if too many
+        show_column_names = FALSE,  # Show column names
+        column_title = "Samples",
+        row_title = "Differentially Expressed Proteins",
+        heatmap_legend_param = list(title = "Normalized Abundance"),
+        row_km = 2,
+        column_km = 2,
+        bottom_annotation = ha_condition,
+        top_annotation = ha_genotype)
+heatmap_plot
+```
+
+Volcano plot.
+```{r}
+volcano_plot <- ggplot(symbiont_DAP %>% 
+                         filter(!is.na(Abundance)), 
+                       aes(x = log2FC, y = -log2(adj.P.Val), color = Abundance)) +
+  geom_point() +
+  geom_hline(yintercept = -log2(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("down" = "blue", "up" = "red", "no difference" = "grey")) +
+  theme_minimal() +
+  labs(title = "Symbiont proteins in the light") +
+  geom_text_repel(aes(label = ifelse(Abundance != "no difference", Protein.Names, "")), 
+                  size = 2.5, 
+                  box.padding = 0.5, 
+                  point.padding = 0.5, 
+                  max.overlaps = Inf, 
+                  segment.color = "grey50")
+volcano_plot
+```
+
+BRITE enrichment down-regulated proteins.
+```{r}
+# Background, proteins of interest and relevant term.
+prot_rich_term <- symbiont_DAP %>%
+  mutate(interest = Abundance == "down") %>%
+  dplyr::rename(term = BRITE) %>%
+  filter(!is.na(term)) %>%
+  dplyr::select(name,adj.P.Val,log2FC,Abundance,interest,term)
+# Terms associated with proteins.
+term_df <- prot_rich_term %>%
+  separate_rows(term, sep = ",")
+# Term over-representation analysis.
+term_enrich <- enricher(
+  gene = prot_rich_term %>% 
+    filter(interest == TRUE) %>%
+    dplyr::select(name) %>%
+    unlist() %>%
+    as.character(),
+  TERM2GENE = term_df %>%
+    dplyr::select(term,name),
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.01
+)
+term_enrich_result <- term_enrich@result
+term_enrich
+```
+
+# Uniting the volcano plots
+
+```{r}
+# Uniting the data
+prot_DAP_united <- prot_DAP %>%
+  left_join(Mcap_DAP %>%
+              mutate(Given_name = ifelse(Preferred_name == "-" | is.na(Preferred_name),NA,Given_name)) %>%
+              dplyr::select(Given_name,name),by="name") %>%
+  left_join(symbiont_DAP %>% 
+              dplyr::select(Gene.Names,name),by="name") %>%
+  mutate(Given_name = ifelse(Organism != "Montipora capitata", Gene.Names,Given_name)) %>%
+  filter(!is.na(Abundance))
+# Plot
+volcano_plot_united <- ggplot(prot_DAP_united, 
+                       aes(x = log2FC, y = -log2(adj.P.Val), color = Abundance)) +
+  geom_point() +
+  geom_hline(yintercept = -log2(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("down" = "blue", "up" = "red", "no difference" = "grey")) +
+  theme_minimal() +
+  geom_text_repel(aes(label = ifelse(Abundance != "no difference", Given_name, "")), 
+                  size = 2.5, 
+                  box.padding = 0.5, 
+                  point.padding = 0.5, 
+                  max.overlaps = Inf,
+                  segment.size = 0.2,
+                  segment.alpha = 0.6,
+                  segment.color = "grey50") +
+  facet_wrap(~Organism,ncol=1) +
+  xlab(expression(log[2](FC))) +
+  ylab(expression(-log[2](p[adjusted]))) +
+  theme(panel.grid = element_blank()) +
+  scale_x_continuous(breaks = seq(floor(min(prot_DAP_united$log2FC)), 
+                                  ceiling(max(prot_DAP_united$log2FC)), 
+                                  by = 2))
+volcano_plot_united
+```
+
+# Photosynthesis
+
+RUBISCO.
+```{r}
+symbiont_DAP %>% 
+  filter(grepl("cbb",Given_name)) %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "RUBISCO (symbiont)")
+```
+
+Photosynthesis proteins
+```{r}
+symbiont_DAP %>% 
+  filter(grepl("ko00194",BRITE), P.Value < 0.05) %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Symbiont - protein contains BRITE term for photosynthesis and p<0.05")
+```
+
+# Reactive oxygen species and protein degradation
+
+M. capitata SOD and CAT.
+```{r}
+SOD_plot <- Mcap_DAP %>% 
+  filter(grepl("SOD",Given_name) |
+           grepl("Catalase",PFAMs) | Given_name == "CAT" | Given_name == "CAT (2)") %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "M. capitata SOD and CAT")
+SOD_plot
+```
+
+Symbiont SOD.
+```{r}
+symbiont_DAP %>% 
+  filter(grepl("Sod",PFAMs) | grepl("Catalase",PFAMs),P.Value<0.05) %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Symbiont SOD and CAT")
+```
+
+Protein degradation
+```{r}
+Mcap_DAP %>% 
+  filter(Given_name == "PSMA3" | Given_name == "PSMD9") %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Protein degradation")
+```
+
+# Calcification
+
+Carbonic anhydrase.
+```{r}
+Mcap_DAP %>% 
+  filter(grepl("CA2",Given_name) | Given_name == "CA3" ) %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Carbonic anhydrase")
+```
+
+Birds?
+```{r}
+Mcap_DAP %>% 
+  filter(grepl("MFGE8",Given_name) | Given_name == "EDIL3") %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Involved in avian biomineralization/ egg shell calcification")
+```
+
+```{r}
+Mcap_DAP %>% 
+  filter(grepl("ATP_Ca_trans_C",PFAMs)) %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "M. capitata plasma membrane calcium ATPase (PMCA)")
+
+```
+
+# Translation
+
+Ribosomes.
+```{r}
+Mcap_DAP %>% 
+  filter(grepl("ibosom",PFAMs),Abundance == "up") %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Ribosomal proteins (PFAMs) - M. capitata")
+```
+
+Symbiont ribosomal proteins.
+```{r}
+Mcap_DAP %>% 
+  filter(grepl("ibosom",PFAMs),P.Value<0.05,abs(log2FC) > 1.5) %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Ribosomal proteins (PFAMs) - symbiont")
+```
+
+# Heterotrhopy
+
+grepl("ko01002",BRITE)
+```{r}
+Mcap_DAP %>% 
+  filter(grepl("ko01002",BRITE),Abundance == "down") %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Significant enrichment for BRITE peptidases and inhibitors - Montipora capitata")
+```
+
+# Vitamin B6 homeostasis
+
+Vitamin B6 biosynthesis.
+```{r}
+Mcap_DAP %>% 
+  filter(Given_name == "PNPO" | Given_name == "PROSC") %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Vitamin B6 homeostasis")
+```
+
+# Other
+
+Clock-controlled genes.
+```{r}
+Mcap_DAP %>% 
+  filter(Given_name == "DHRS12" | Given_name == "UTP18" | Given_name == "PNPO") %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Clock-controlled genes")
+```
+
+# Household genes
+```{r}
+symbiont_DAP %>% 
+  filter(Given_name == "ARP4") %>%
+  mutate(Given_name_with_p = paste(paste(Given_name,": ",str_trunc(PFAMs, width = 30, side = "right", ellipsis = "..."),sep=""), 
+                                   "\np* =",format(adj.P.Val, digits = 2),
+                                   "\np =",format(P.Value, digits = 2),sep="")) %>%
+  dplyr::select(name,Given_name_with_p) %>%
+  left_join(prot_long %>% dplyr::select(name,Log2Intensity,condition,Genotype),by="name") %>%
+  ggplot(aes(x=condition,y=Log2Intensity,fill=condition))+
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("Light" = "gold", "Shade" = "lightblue")) +
+  facet_wrap(~Given_name_with_p) +
+  theme_minimal() +
+  labs(x="condition",
+       title = "Symbiont actin")
+```
+
+# Tables
+
+Montipora capitata abundances.
+```{r}
+write.csv(prot_wide %>%
+            filter(Organism == "Montipora capitata") %>%
+            dplyr::select(-c(name,ID,Genes,Organism)),"Montipora_capitata_quantifications.csv",
+          row.names = FALSE)
+```
+
+Symbiodiniaceae abundances.
+```{r}
+write.csv(prot_wide %>%
+            filter(Organism != "Montipora capitata") %>%
+            dplyr::select(-c(name,ID,Genes,Organism)),"Symbiodiniaceae_quantifications.csv",
+          row.names = FALSE)
+```
+
+Montipora capitata biological annotation + DAP
+```{r}
+write.csv(Mcap_DAP %>%
+            dplyr::select(-c(name,Organism)),"Montipora_capitata_DAP_annotation.csv",
+          row.names = FALSE)
+```
+
+Montipora capitata biological annotation + DAP
+```{r}
+write.csv(symbiont_DAP %>%
+            dplyr::select(-c(name,Organism)),"Symbiodiniaceae_DAP_annotation.csv",
+          row.names = FALSE)
+```
+
+
+
